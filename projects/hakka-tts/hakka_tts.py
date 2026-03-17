@@ -2,7 +2,7 @@
 Hakka TTS – 客語漢字 → Speech
 ==============================
 Pipeline:
-  漢字 → formog2p (IPA per syllable) → tone pitch injection → espeak-ng IPA mode → WAV
+  漢字 → formog2p (IPA per syllable) → per-syllable espeak-ng synthesis with pitch control → WAV
 
 Supported dialects (腔調):
   hak_sx   四縣 (Sixian)
@@ -74,44 +74,60 @@ _TONE_PITCH: dict[str, tuple[int, int]] = {
 }
 
 
-def _syllable_to_ipa_espeak(syllable: str) -> str:
-    """
-    Convert one formog2p syllable token to espeak IPA phoneme notation.
-    Input:  "tʰ-ien_24"
-    Output: "tʰien[[t:20,60]]"
-    """
-    tone_str = ""
-    if "_" in syllable:
-        body, tone_str = syllable.rsplit("_", 1)
-    else:
-        body = syllable
+@dataclass
+class SyllableInfo:
+    """Parsed syllable with IPA body and tone pitch."""
+    ipa: str
+    tone: str
+    pitch: int  # average pitch 0-100 for this tone
 
-    # Remove the '-' separator between onset and rime (just concatenate)
-    ipa_body = body.replace("-", "")
+    @staticmethod
+    def from_token(token: str) -> "SyllableInfo":
+        """Parse a formog2p syllable token like 'tʰ-ien_24'."""
+        tone_str = ""
+        if "_" in token:
+            body, tone_str = token.rsplit("_", 1)
+        else:
+            body = token
+        ipa_body = body.replace("-", "")
+        if tone_str in _TONE_PITCH:
+            p0, p1 = _TONE_PITCH[tone_str]
+            pitch = (p0 + p1) // 2
+        else:
+            pitch = 50  # default mid pitch
+        return SyllableInfo(ipa=ipa_body, tone=tone_str, pitch=pitch)
 
-    if tone_str in _TONE_PITCH:
-        p0, p1 = _TONE_PITCH[tone_str]
-        return f"{ipa_body}[[t:{p0},{p1}]]"
-    return ipa_body
+
+def text_to_syllables(text: str, dialect: str) -> Tuple[List[SyllableInfo], List[str]]:
+    """
+    Convert Hakka Chinese text to a list of SyllableInfo objects.
+    Returns: (syllables, unknown_words)
+    """
+    result: G2PResult = g2p(text, dialect, "ipa")
+
+    syllables: list[SyllableInfo] = []
+    for entry in result.pronunciations:
+        if entry in ("，", "。", "？", "！", "、"):
+            continue
+        for syl in entry.split():
+            syllables.append(SyllableInfo.from_token(syl))
+
+    return syllables, result.unknown_words
 
 
 def text_to_phoneme_str(text: str, dialect: str) -> Tuple[str, List[str]]:
     """
-    Convert Hakka Chinese text to an espeak IPA phoneme string.
+    Convert Hakka Chinese text to a display-friendly IPA phoneme string.
     Returns: (phoneme_str, unknown_words)
     """
-    result: G2PResult = g2p(text, dialect, "ipa")
-
-    parts: list[str] = []
-    for entry in result.pronunciations:
-        if entry in ("，", "。", "？", "！", "、"):
-            parts.append(" ")
-            continue
-        for syl in entry.split():
-            parts.append(_syllable_to_ipa_espeak(syl))
-        parts.append(" ")
-
-    return "".join(parts).strip(), result.unknown_words
+    syllables, unknown = text_to_syllables(text, dialect)
+    parts = []
+    for s in syllables:
+        if s.tone:
+            parts.append(f"{s.ipa}({s.tone})")
+        else:
+            parts.append(s.ipa)
+    return " ".join(parts), unknown
 
 
 # ---------------------------------------------------------------------------
@@ -169,48 +185,22 @@ def _get_lib() -> ctypes.CDLL:
     return lib
 
 
-def synthesize(text: str, dialect: str, rate: int = 300, pitch: int = 50) -> "TTSResult":
-    """
-    Synthesize Hakka Chinese text to PCM audio.
-
-    Args:
-        text:    漢字
-        dialect: one of DIALECTS keys (e.g. "hak_sx")
-        rate:    speech rate wpm 80-450 (default 150)
-        pitch:   pitch 0-100 (default 50)
-
-    Returns:
-        TTSResult
-    """
+def _ensure_espeak_init():
+    """Initialize espeak-ng once per process."""
     global _lib_initialized, _cb_ref
-
-    if dialect not in DIALECTS:
-        raise ValueError(f"Unknown dialect '{dialect}'. Valid: {list(DIALECTS)}")
-
-    # Step 1: G2P → IPA phoneme string
-    phoneme_str, unknown = text_to_phoneme_str(text, dialect)
-
     lib = _get_lib()
 
-    # Step 2: Init once per process (calling Initialize twice causes hangs)
     if not _lib_initialized:
         lib.espeak_Initialize(_AUDIO_OUTPUT_SYNCHRONOUS, 500, _ESPEAK_DATA.encode(), 0)
         _lib_initialized = True
 
-    # Step 3: Voice + params
-    lib.espeak_SetVoiceByName(b"en")   # English as phoneme base; we supply IPA directly
-    lib.espeak_SetParameter(_espeakRATE,  rate,  0)
-    lib.espeak_SetParameter(_espeakPITCH, pitch, 0)
-
-    # Step 4: Register PCM callback
+    # Register PCM callback (keep reference alive)
     SYNTH_CB = ctypes.CFUNCTYPE(
         ctypes.c_int,
         ctypes.POINTER(ctypes.c_short),
         ctypes.c_int,
         ctypes.c_void_p,
     )
-
-    _pcm_chunks.clear()
 
     def _cb(wav_ptr, numsamples, events_ptr):
         if wav_ptr and numsamples > 0:
@@ -223,8 +213,19 @@ def synthesize(text: str, dialect: str, rate: int = 300, pitch: int = 50) -> "TT
     _cb_ref = SYNTH_CB(_cb)
     lib.espeak_SetSynthCallback(_cb_ref)
 
-    # Step 5: Synthesize in IPA mode
-    encoded = phoneme_str.encode("utf-8")
+    # Use English voice as IPA phoneme renderer base
+    lib.espeak_SetVoiceByName(b"en")
+
+    return lib
+
+
+def _synth_one_syllable(lib, ipa: str, rate: int, pitch: int) -> bytes:
+    """Synthesize a single IPA syllable with specific pitch. Returns raw PCM."""
+    _pcm_chunks.clear()
+    lib.espeak_SetParameter(_espeakRATE, rate, 0)
+    lib.espeak_SetParameter(_espeakPITCH, pitch, 0)
+
+    encoded = ipa.encode("utf-8")
     buf = ctypes.create_string_buffer(encoded)
     lib.espeak_Synth(
         buf, len(encoded) + 1,
@@ -233,12 +234,48 @@ def synthesize(text: str, dialect: str, rate: int = 300, pitch: int = 50) -> "TT
         None, None,
     )
     lib.espeak_Synchronize()
+    return b"".join(_pcm_chunks)
 
-    pcm = b"".join(_pcm_chunks)
+
+def synthesize(text: str, dialect: str, rate: int = 300, pitch: int = 50) -> "TTSResult":
+    """
+    Synthesize Hakka Chinese text to PCM audio.
+
+    Uses per-syllable synthesis: each syllable is rendered individually with
+    its tone-appropriate pitch value, then concatenated. This avoids the bug
+    where espeak-ng IPA mode reads pitch control tags as literal text.
+
+    Args:
+        text:    漢字
+        dialect: one of DIALECTS keys (e.g. "hak_sx")
+        rate:    speech rate wpm 80-450 (default 300)
+        pitch:   base pitch 0-100 (default 50, modulated by tone)
+
+    Returns:
+        TTSResult
+    """
+    if dialect not in DIALECTS:
+        raise ValueError(f"Unknown dialect '{dialect}'. Valid: {list(DIALECTS)}")
+
+    # Step 1: G2P → syllable list with tone info
+    syllables, unknown = text_to_syllables(text, dialect)
+    phoneme_str, _ = text_to_phoneme_str(text, dialect)
+
+    # Step 2: Init espeak
+    lib = _ensure_espeak_init()
+
+    # Step 3: Synthesize each syllable with tone-appropriate pitch
+    all_pcm = b""
+    for syl in syllables:
+        # Blend the syllable's tone pitch with the user-requested base pitch
+        # tone pitch is 0-100; base pitch shifts the center
+        effective_pitch = max(0, min(99, syl.pitch + (pitch - 50)))
+        pcm = _synth_one_syllable(lib, syl.ipa, rate, effective_pitch)
+        all_pcm += pcm
 
     return TTSResult(
         sample_rate=22050,
-        pcm=pcm,
+        pcm=all_pcm,
         unknown_words=unknown,
         phoneme_str=phoneme_str,
         dialect=dialect,
