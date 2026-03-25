@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>客語 ASR × Model Merging 研究提案</title>
+  <style>
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    span.underline{text-decoration: underline;}
+    div.column{display: inline-block; vertical-align: top; width: 50%;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    ul.task-list{list-style: none;}
+  </style>
+  <script src="/usr/share/javascript/mathjax/tex-mml-chtml.js" type="text/javascript"></script>
+</head>
+<body>
+<header id="title-block-header">
+<h1 class="title">客語 ASR × Model Merging 研究提案</h1>
+</header>
+<h1 id="客語-asr-model-merging-研究提案分析報告">客語 ASR × Model Merging 研究提案分析報告</h1>
+<blockquote>
+<p>作者：Anna Liang / June（研究助理）<br />
+日期：2026-03-21<br />
+版本：v1.0</p>
+</blockquote>
+<hr />
+<h2 id="目錄">目錄</h2>
+<ol type="1">
+<li><a href="#1-研究動機與背景">研究動機與背景</a></li>
+<li><a href="#2-model-merging-數學基礎">Model Merging 數學基礎</a></li>
+<li><a href="#3-語音領域-model-merging-最新突破2024-2026">語音領域 Model Merging 最新突破（2024–2026）</a></li>
+<li><a href="#4-客語-asr-現有研究盤點">客語 ASR 現有研究盤點</a></li>
+<li><a href="#5-提案設計stitchshanks-式客語-asr">提案設計：Stitch/SHANKS 式客語 ASR</a></li>
+<li><a href="#6-數學框架與理論分析">數學框架與理論分析</a></li>
+<li><a href="#7-實驗規劃">實驗規劃</a></li>
+<li><a href="#8-風險評估與挑戰">風險評估與挑戰</a></li>
+<li><a href="#9-時程規劃">時程規劃</a></li>
+<li><a href="#10-參考文獻">參考文獻</a></li>
+</ol>
+<hr />
+<h2 id="研究動機與背景">1. 研究動機與背景</h2>
+<h3 id="問題定義">1.1 問題定義</h3>
+<p>客語（Hakka）為台灣法定國家語言之一，但在 ASR 資源上屬於<strong>極低資源語言（extremely low-resource）</strong>：</p>
+<ul>
+<li>標註語音資料量遠低於華語/英語（估計 &lt; 100 小時高品質標註）</li>
+<li>客語方言多元（四縣、海陸、大埔、饒平、詔安等至少 5 種主要腔調）</li>
+<li>漢字書寫系統不統一，存在多對多的「音→字」對應問題</li>
+<li>現有基座模型（如 Whisper）對客語支援極弱或完全沒有</li>
+</ul>
+<h3 id="核心假設">1.2 核心假設</h3>
+<blockquote>
+<p><strong>若我們能利用 Model Merging 技術，將多個已在相關語言/任務上 fine-tune 的模型 “stitch” 成一個客語 ASR 模型，則可以在不需要大量客語標註資料的前提下，獲得可用的客語語音→客語漢字轉寫能力。</strong></p>
+</blockquote>
+<p>這個方向的核心直覺是： - 華語 ASR 模型已學到「漢字語言模型」知識 - 客語的音韻結構與粵語、華語有部分重疊 - 透過 model merging，我們可以把「聲學前端對客語音素的理解」和「解碼端對漢字的理解」拼接在一起</p>
+<hr />
+<h2 id="model-merging-數學基礎">2. Model Merging 數學基礎</h2>
+<h3 id="task-arithmetic任務算術">2.1 Task Arithmetic（任務算術）</h3>
+<p><strong>核心定義 (Ilharco et al., 2023)：</strong></p>
+<p>給定預訓練模型權重 <span class="math inline">\(\theta_{\text{pre}}\)</span>，在任務 <span class="math inline">\(t\)</span> 上 fine-tune 得到 <span class="math inline">\(\theta_t\)</span>，定義<strong>任務向量（task vector）</strong>：</p>
+<p><span class="math display">\[\tau_t = \theta_t - \theta_{\text{pre}}\]</span></p>
+<p>多任務合併的模型為：</p>
+<p><span class="math display">\[\theta_{\text{merged}} = \theta_{\text{pre}} + \lambda \sum_{t} \tau_t\]</span></p>
+<p>其中 <span class="math inline">\(\lambda \in [0, 1]\)</span> 為 scaling coefficient。</p>
+<p><strong>數學直覺：</strong> 假設各任務的 fine-tuning 移動方向大致正交（低干涉），則線性組合可近似保留各任務能力。</p>
+<h3 id="ties-mergingtrim-elect-sign-merge">2.2 TIES-Merging（Trim, Elect Sign &amp; Merge）</h3>
+<p><strong>Yadav et al. (2024)</strong> 提出處理任務向量間的<strong>符號衝突（sign conflict）</strong>問題：</p>
+<ol type="1">
+<li><strong>Trim（修剪）：</strong> 對每個任務向量 <span class="math inline">\(\tau_t\)</span>，僅保留變化量最大的 top-k% 參數</li>
+<li><strong>Elect Sign（選擇符號）：</strong> 對每個參數位置，取多數任務向量的符號方向</li>
+<li><strong>Merge（合併）：</strong> 對符號一致的值取平均</li>
+</ol>
+<p><span class="math display">\[\tau_{\text{merged}}^{(i)} = \text{sign}_{\text{majority}}^{(i)} \cdot \frac{1}{|A_i|} \sum_{t \in A_i} |\tau_t^{(i)}|\]</span></p>
+<p>其中 <span class="math inline">\(A_i\)</span> 是第 <span class="math inline">\(i\)</span> 個參數位置上符號與 majority sign 一致的任務集合。</p>
+<h3 id="daredrop-and-rescale">2.3 DARE（Drop And REscale）</h3>
+<p><strong>Yu et al. (2024)</strong> 提出在合併前隨機 drop 任務向量中的部分參數：</p>
+<p><span class="math display">\[\tilde{\tau}_t = \frac{m \odot \tau_t}{1 - p}\]</span></p>
+<p>其中 <span class="math inline">\(m \sim \text{Bernoulli}(1-p)\)</span> 為隨機遮罩，<span class="math inline">\(p\)</span> 為 drop rate，除以 <span class="math inline">\((1-p)\)</span> 做 rescale 保持期望值不變。</p>
+<p><strong>數學意義：</strong> 稀疏化任務向量可降低不同任務間的干涉（類似 dropout 的正則化效果）。</p>
+<h3 id="slerpspherical-linear-interpolation">2.4 SLERP（Spherical Linear Interpolation）</h3>
+<p>用於兩個模型間的球面插值：</p>
+<p><span class="math display">\[\theta_{\text{merged}} = \frac{\sin((1-t)\Omega)}{\sin \Omega} \theta_A + \frac{\sin(t \cdot \Omega)}{\sin \Omega} \theta_B\]</span></p>
+<p>其中 <span class="math inline">\(\Omega = \arccos\left(\frac{\theta_A \cdot \theta_B}{\|\theta_A\| \|\theta_B\|}\right)\)</span>，<span class="math inline">\(t \in [0, 1]\)</span>。</p>
+<p><strong>優勢：</strong> 保持權重向量的 norm，避免線性插值可能造成的 norm 衰減問題。</p>
+<h3 id="model-stitching模型拼接">2.5 Model Stitching（模型拼接）</h3>
+<p>不同於上述方法在同一架構的權重空間做合併，<strong>Model Stitching</strong> 是：</p>
+<ul>
+<li>取模型 A 的前 <span class="math inline">\(l\)</span> 層作為 encoder 前段</li>
+<li>取模型 B 的後 <span class="math inline">\(L - l\)</span> 層作為 decoder 後段</li>
+<li>在拼接處插入一個輕量的 <strong>stitching layer</strong>（通常為 1×1 卷積或線性層）來對齊表示空間</li>
+</ul>
+<p><span class="math display">\[h_{\text{stitch}} = W_s \cdot h_A^{(l)} + b_s\]</span></p>
+<p><span class="math display">\[y = f_B^{(l+1:L)}(h_{\text{stitch}})\]</span></p>
+<p><strong>Stitching layer 的訓練成本極低（僅需訓練 <span class="math inline">\(W_s, b_s\)</span>）。</strong></p>
+<h3 id="lors-merginglow-rank-and-sparse-merging">2.6 LoRS-Merging（Low-Rank and Sparse Merging）</h3>
+<p><strong>Zhao et al. (2025)</strong> 針對語音的最新方法，結合低秩分解與稀疏剪枝：</p>
+<ol type="1">
+<li>對每個任務向量做 SVD 分解：<span class="math inline">\(\tau_t \approx U_r \Sigma_r V_r^T\)</span>（保留 rank-<span class="math inline">\(r\)</span>）</li>
+<li>再做稀疏剪枝，移除冗餘參數</li>
+<li>合併時減少語言間干涉，達成 &gt; 20% 的正規化性能提升</li>
+</ol>
+<hr />
+<h2 id="語音領域-model-merging-最新突破20242026">3. 語音領域 Model Merging 最新突破（2024–2026）</h2>
+<h3 id="關鍵論文一覽">3.1 關鍵論文一覽</h3>
+<table>
+<colgroup>
+<col style="width: 15%" />
+<col style="width: 15%" />
+<col style="width: 25%" />
+<col style="width: 43%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>論文</th>
+<th>時間</th>
+<th>核心貢獻</th>
+<th>與客語 ASR 的關聯</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><strong>Task Arithmetic with Support Languages for Low-Resource ASR</strong> (Rafkin et al.)</td>
+<td>2026.01</td>
+<td>將「語言」視為 task，用 task arithmetic 合併高/低資源語言的 Whisper 模型，23 種低資源語言 WER 提升達 10%</td>
+<td><strong>直接可用</strong>——客語即為 low-resource target</td>
+</tr>
+<tr class="even">
+<td><strong>LoRS-Merging</strong> (Zhao et al.)</td>
+<td>2025.02</td>
+<td>低秩+稀疏的多語言語音合併，Whisper 上 10 語言實驗達 20%+ 提升</td>
+<td><strong>核心方法參考</strong>——語音多語言 merging 的 SOTA</td>
+</tr>
+<tr class="odd">
+<td><strong>Group-Aware Partial Model Merging for Children’s ASR</strong> (Rolland &amp; Abad)</td>
+<td>2025.11</td>
+<td>部分參數合併（partial merging），針對群體特徵差異</td>
+<td><strong>方言適配啟發</strong>——客語方言可視為不同 group</td>
+</tr>
+<tr class="even">
+<td><strong>Exploring Model Merging for Multi-Domain Adaptation in ASR</strong> (Carvalho et al.)</td>
+<td>2026.03</td>
+<td>系統性比較多種 merging 方法在 ASR 多域適配的效果</td>
+<td><strong>方法論基準</strong>——可參考其實驗設計</td>
+</tr>
+<tr class="odd">
+<td><strong>Speech-FT: Merging Pre-trained and Fine-Tuned Speech Models</strong> (Lin et al., NTU)</td>
+<td>2025.02</td>
+<td>合併預訓練與 fine-tune 後的語音表示模型以保持跨任務泛化</td>
+<td><strong>台灣研究組</strong>——Hung-yi Lee 組，可合作</td>
+</tr>
+<tr class="even">
+<td><strong>Robust Fine-tuning via Model Merging: Disordered Speech</strong> (Ducorroy &amp; Riad)</td>
+<td>2025.05</td>
+<td>用 model merging 做 ASR robustness 提升</td>
+<td>魯棒性增強思路</td>
+</tr>
+<tr class="odd">
+<td><strong>Selective Attention Merging for Low Resource ASR</strong> (Shankar et al.)</td>
+<td>2025.01</td>
+<td>針對低資源場景的注意力機制選擇性合併</td>
+<td><strong>低資源策略直接參考</strong></td>
+</tr>
+<tr class="even">
+<td><strong>Correlation-Permutation for Speech-Music Encoder Merging</strong> (Ritter-Gutierrez et al.)</td>
+<td>2025.06</td>
+<td>用 correlation + permutation alignment 做跨模態 encoder 合併</td>
+<td>跨模態 encoder 對齊技術</td>
+</tr>
+<tr class="odd">
+<td><strong>Efficient Dialect-Aware Modeling for Taiwanese Hakka</strong> (Peng et al.)</td>
+<td>2026.02</td>
+<td><strong>直接針對台灣客語</strong>的方言感知建模</td>
+<td><strong>最直接相關——客語方言 ASR</strong></td>
+</tr>
+<tr class="even">
+<td><strong>Model Merging in the Era of LLMs: Survey</strong> (Song &amp; Zheng)</td>
+<td>2026.03</td>
+<td>最新 survey，涵蓋所有主流方法</td>
+<td>方法論總覽</td>
+</tr>
+</tbody>
+</table>
+<h3 id="重點發現">3.2 重點發現</h3>
+<ol type="1">
+<li><p><strong>Task Arithmetic 在語音領域確認有效：</strong> Rafkin et al. (2026) 首次將 task arithmetic 直接應用於低資源 ASR，結果顯示在 Whisper 上用高資源「支持語言」的 task vector 合併可以穩定降低 WER。</p></li>
+<li><p><strong>低秩稀疏合併優於傳統方法：</strong> LoRS-Merging 顯示低秩分解可以有效降低語言間干涉，這對客語（與華語有重疊又有差異）的場景特別重要。</p></li>
+<li><p><strong>部分合併（Partial Merging）是關鍵：</strong> 不是所有層都應該合併——底層（acoustic feature）和高層（language model）可能需要不同的合併策略。</p></li>
+<li><p><strong>台灣已有相關研究基礎：</strong> Peng et al. (2026) 的客語方言感知建模、NTU Hung-yi Lee 組的 Speech-FT 都是可以直接銜接的研究。</p></li>
+</ol>
+<hr />
+<h2 id="客語-asr-現有研究盤點">4. 客語 ASR 現有研究盤點</h2>
+<h3 id="台灣客語語音資源">4.1 台灣客語語音資源</h3>
+<ul>
+<li><strong>客家委員會語料庫</strong>：最主要的客語語音資源</li>
+<li><strong>VoxHakka</strong> (2024)：客語 TTS 系統，涵蓋多種腔調</li>
+<li><strong>Peng et al. (2026)</strong>：方言感知的客語語音處理，使用 dialect embedding 做 conditioning</li>
+</ul>
+<h3 id="客語-asr-的特殊挑戰">4.2 客語 ASR 的特殊挑戰</h3>
+<ol type="1">
+<li><strong>聲調系統</strong>：客語有 6-7 個聲調（依方言），比華語更複雜</li>
+<li><strong>方言變異</strong>：四縣腔與海陸腔的聲母/韻母/聲調系統差異顯著</li>
+<li><strong>漢字對應</strong>：同一客語詞可能對應多種漢字寫法（尚無統一標準）</li>
+<li><strong>Code-switching</strong>：客語使用者經常混用華語，產生語碼轉換</li>
+</ol>
+<hr />
+<h2 id="提案設計stitchshanks-式客語-asr">5. 提案設計：Stitch/SHANKS 式客語 ASR</h2>
+<h3 id="核心架構">5.1 核心架構</h3>
+<p>我們提出 <strong>Hakka-Stitch</strong> 架構，結合 Model Stitching 與 Task Arithmetic：</p>
+<pre><code>┌──────────────────────────────────────────────────────┐
+│                  Hakka-Stitch Pipeline                │
+│                                                      │
+│  ┌─────────────┐   ┌──────────┐   ┌──────────────┐  │
+│  │  Acoustic    │   │ Stitch   │   │  Language     │  │
+│  │  Encoder     │──▶│  Layer   │──▶│  Decoder      │  │
+│  │  (merged)    │   │          │   │  (merged)     │  │
+│  └─────────────┘   └──────────┘   └──────────────┘  │
+│        ▲                                   ▲         │
+│        │                                   │         │
+│  ┌─────┴──────┐                    ┌───────┴──────┐  │
+│  │ τ_mandarin │                    │ τ_mandarin   │  │
+│  │ τ_cantonese│                    │ τ_hakka_lm   │  │
+│  │ τ_hakka_ph │                    │ τ_cantonese  │  │
+│  └────────────┘                    └──────────────┘  │
+└──────────────────────────────────────────────────────┘</code></pre>
+<h3 id="三階段方法">5.2 三階段方法</h3>
+<h4 id="stage-1-task-vector-萃取">Stage 1: Task Vector 萃取</h4>
+<p>從 Whisper（或其他基座模型）出發，分別 fine-tune 得到多個專家模型：</p>
+<ul>
+<li><span class="math inline">\(\theta_{\text{mandarin}}\)</span>：華語 ASR fine-tune</li>
+<li><span class="math inline">\(\theta_{\text{cantonese}}\)</span>：粵語 ASR fine-tune（音韻相近）</li>
+<li><span class="math inline">\(\theta_{\text{hakka-small}}\)</span>：少量客語資料 fine-tune</li>
+<li><span class="math inline">\(\theta_{\text{tonal}}\)</span>：聲調語言通用 fine-tune</li>
+</ul>
+<p>萃取任務向量：<span class="math inline">\(\tau_t = \theta_t - \theta_{\text{pre}}\)</span></p>
+<h4 id="stage-2-selective-merging選擇性合併">Stage 2: Selective Merging（選擇性合併）</h4>
+<p><strong>分層策略：</strong></p>
+<ul>
+<li><p><strong>Encoder 前段（Layer 1-8）</strong>：以 <span class="math inline">\(\tau_{\text{hakka-small}}\)</span> 為主，加入少量 <span class="math inline">\(\tau_{\text{cantonese}}\)</span>（音素相似性） <span class="math display">\[\theta_{\text{enc}}^{1:8} = \theta_{\text{pre}} + \alpha_1 \tau_{\text{hakka}}^{1:8} + \alpha_2 \tau_{\text{cantonese}}^{1:8}\]</span></p></li>
+<li><p><strong>Encoder 後段（Layer 9-16）</strong>：用 LoRS-Merging 合併多語言 task vector <span class="math display">\[\theta_{\text{enc}}^{9:16} = \theta_{\text{pre}} + \text{LoRS}(\tau_{\text{mandarin}}^{9:16}, \tau_{\text{cantonese}}^{9:16}, \tau_{\text{hakka}}^{9:16})\]</span></p></li>
+<li><p><strong>Decoder</strong>：以 <span class="math inline">\(\tau_{\text{mandarin}}\)</span> 為主（漢字語言模型），加入 <span class="math inline">\(\tau_{\text{hakka-lm}}\)</span> <span class="math display">\[\theta_{\text{dec}} = \theta_{\text{pre}} + \beta_1 \tau_{\text{mandarin}}^{\text{dec}} + \beta_2 \tau_{\text{hakka-lm}}^{\text{dec}}\]</span></p></li>
+</ul>
+<h4 id="stage-3-stitching-layer-微調">Stage 3: Stitching Layer 微調</h4>
+<p>在合併後的 encoder 和 decoder 之間插入 stitching layer，僅用<strong>少量客語標註資料</strong>（&lt; 10 小時）微調：</p>
+<p><span class="math display">\[\mathcal{L}_{\text{stitch}} = \sum_{(x, y) \in \mathcal{D}_{\text{hakka}}} -\log P(y | x; \theta_{\text{merged}}, W_s, b_s)\]</span></p>
+<p>只優化 <span class="math inline">\(W_s, b_s\)</span>（參數量 &lt;&lt; 全模型），訓練成本極低。</p>
+<h3 id="方言適配擴展">5.3 方言適配擴展</h3>
+<p>利用 <strong>Group-Aware Partial Merging</strong> 的思路：</p>
+<ul>
+<li>為每種客語腔調維護一個 dialect-specific 的 task vector</li>
+<li>合併時根據目標腔調調整各 task vector 的權重</li>
+<li>可用 dialect embedding 或 learned routing 做自動選擇</li>
+</ul>
+<p><span class="math display">\[\theta_{\text{dialect}_d} = \theta_{\text{merged}} + \gamma_d \cdot \tau_{\text{dialect}_d}\]</span></p>
+<hr />
+<h2 id="數學框架與理論分析">6. 數學框架與理論分析</h2>
+<h3 id="干涉分析interference-analysis">6.1 干涉分析（Interference Analysis）</h3>
+<p>定義兩個任務向量間的<strong>干涉度</strong>：</p>
+<p><span class="math display">\[I(\tau_i, \tau_j) = \frac{\sum_k \mathbb{1}[\text{sign}(\tau_i^{(k)}) \neq \text{sign}(\tau_j^{(k)})] \cdot |\tau_i^{(k)}| \cdot |\tau_j^{(k)}|}{\sum_k |\tau_i^{(k)}| \cdot |\tau_j^{(k)}|}\]</span></p>
+<p><strong>假設：</strong> 華語 vs 客語的干涉度在 encoder 淺層較高（音素差異）、在 decoder 較低（共用漢字系統）。</p>
+<p>→ 這支持我們「分層合併策略」的合理性。</p>
+<h3 id="最優合併係數求解">6.2 最優合併係數求解</h3>
+<p>給定驗證集 <span class="math inline">\(\mathcal{D}_{\text{val}}\)</span>，最優合併係數可透過以下優化問題求解：</p>
+<p><span class="math display">\[\alpha^* = \arg\min_{\alpha} \text{WER}\left(\theta_{\text{pre}} + \sum_t \alpha_t \tau_t; \mathcal{D}_{\text{val}}\right)\]</span></p>
+<p>由於 WER 不可微分，可使用： - <strong>Grid search</strong>（如 Rafkin et al. 2026 使用的方法） - <strong>Bayesian optimization</strong> - <strong>CMA-ES</strong>（Covariance Matrix Adaptation Evolution Strategy）</p>
+<h3 id="lors-的理論保證">6.3 LoRS 的理論保證</h3>
+<p>對任務向量做 rank-<span class="math inline">\(r\)</span> 近似，誤差界為：</p>
+<p><span class="math display">\[\|\tau_t - \tau_t^{(r)}\|_F \leq \sigma_{r+1}(\tau_t)\]</span></p>
+<p>其中 <span class="math inline">\(\sigma_{r+1}\)</span> 為第 <span class="math inline">\(r+1\)</span> 個奇異值。只要任務向量的有效秩（effective rank）低，truncation 損失就小。</p>
+<p><strong>語音任務向量通常有低有效秩</strong>（因為 fine-tuning 主要改變少數關鍵方向），這為 LoRS-Merging 在語音上的成功提供了理論依據。</p>
+<h3 id="stitching-layer-的表示對齊">6.4 Stitching Layer 的表示對齊</h3>
+<p>Stitching layer 本質上在做兩個表示空間之間的<strong>仿射對齊</strong>：</p>
+<p><span class="math display">\[h_B = W_s h_A + b_s\]</span></p>
+<p>若兩個模型的表示空間存在近似的線性對應關係（linear mode connectivity），則 stitching layer 可以用少量資料高效學習。</p>
+<p><strong>Kornblith et al. (2019)</strong> 的 CKA（Centered Kernel Alignment）可以用來事先評估不同模型在各層的表示相似度，指導 stitching point 的選擇。</p>
+<hr />
+<h2 id="實驗規劃">7. 實驗規劃</h2>
+<h3 id="基線系統">7.1 基線系統</h3>
+<table>
+<thead>
+<tr class="header">
+<th>系統</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>B1: Whisper-large-v3 zero-shot</td>
+<td>直接用 Whisper 辨識客語（預期很差）</td>
+</tr>
+<tr class="even">
+<td>B2: Whisper + 客語 full fine-tune</td>
+<td>用所有可得客語資料 fine-tune</td>
+</tr>
+<tr class="odd">
+<td>B3: Whisper + 華語 fine-tune → 客語 fine-tune</td>
+<td>Sequential transfer</td>
+</tr>
+<tr class="even">
+<td>B4: Multi-task training（華語+客語+粵語）</td>
+<td>傳統多任務方式</td>
+</tr>
+</tbody>
+</table>
+<h3 id="提案系統">7.2 提案系統</h3>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr class="header">
+<th>系統</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>P1: Task Arithmetic（簡單加法）</td>
+<td><span class="math inline">\(\theta = \theta_{\text{pre}} + \lambda(\tau_{\text{mandarin}} + \tau_{\text{hakka}})\)</span></td>
+</tr>
+<tr class="even">
+<td>P2: TIES-Merging</td>
+<td>帶符號選擇的 task vector 合併</td>
+</tr>
+<tr class="odd">
+<td>P3: DARE + Task Arithmetic</td>
+<td>稀疏化後合併</td>
+</tr>
+<tr class="even">
+<td>P4: LoRS-Merging</td>
+<td>低秩稀疏合併</td>
+</tr>
+<tr class="odd">
+<td>P5: Hakka-Stitch（分層合併+stitching）</td>
+<td>本提案的完整方法</td>
+</tr>
+<tr class="even">
+<td>P6: Hakka-Stitch + dialect adaptation</td>
+<td>P5 + 方言適配</td>
+</tr>
+</tbody>
+</table>
+<h3 id="評估指標">7.3 評估指標</h3>
+<ul>
+<li><strong>CER（Character Error Rate）</strong>：客語漢字的字元錯誤率（主指標）</li>
+<li><strong>WER（Word Error Rate）</strong>：詞級錯誤率</li>
+<li><strong>Tone Accuracy</strong>：聲調辨識準確率（客語特有評估）</li>
+<li><strong>Cross-dialect transfer</strong>：不同腔調間的遷移效果</li>
+<li><strong>Inference speed</strong>：推論速度（FLOPs, latency）</li>
+</ul>
+<h3 id="資料需求">7.4 資料需求</h3>
+<table>
+<thead>
+<tr class="header">
+<th>資料</th>
+<th>用途</th>
+<th>預估量</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>華語 ASR 資料</td>
+<td>Fine-tune 華語模型</td>
+<td>&gt; 1000 hr（公開可得）</td>
+</tr>
+<tr class="even">
+<td>粵語 ASR 資料</td>
+<td>Fine-tune 粵語模型</td>
+<td>&gt; 100 hr（Common Voice 等）</td>
+</tr>
+<tr class="odd">
+<td>客語標註語音</td>
+<td>Fine-tune 客語模型 + 驗證</td>
+<td>10-50 hr（客委會語料庫）</td>
+</tr>
+<tr class="even">
+<td>客語文本</td>
+<td>訓練客語 LM</td>
+<td>文本量待調查</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="風險評估與挑戰">8. 風險評估與挑戰</h2>
+<h3 id="高風險項">8.1 高風險項</h3>
+<table>
+<thead>
+<tr class="header">
+<th>風險</th>
+<th>嚴重度</th>
+<th>緩解策略</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>客語與華語/粵語的表示空間差異過大，merging 效果差</td>
+<td>高</td>
+<td>先用 CKA 分析表示相似度；退化為 sequential fine-tune</td>
+</tr>
+<tr class="even">
+<td>客語漢字不統一，導致 CER 虛高</td>
+<td>高</td>
+<td>建立標準化對照表；使用 phoneme-level 評估作為補充</td>
+</tr>
+<tr class="odd">
+<td>聲調辨識能力無法透過 merging 遷移</td>
+<td>中</td>
+<td>額外加入聲調分類 auxiliary loss</td>
+</tr>
+<tr class="even">
+<td>方言差異造成「一個模型無法通吃」</td>
+<td>中</td>
+<td>使用 dialect-aware partial merging</td>
+</tr>
+</tbody>
+</table>
+<h3 id="已知限制">8.2 已知限制</h3>
+<ul>
+<li>Model merging 是一種近似方法，理論保證有限</li>
+<li>Stitching layer 的容量受限，可能需要多層 stitching</li>
+<li>客語語料品質參差不齊</li>
+</ul>
+<hr />
+<h2 id="時程規劃">9. 時程規劃</h2>
+<table>
+<thead>
+<tr class="header">
+<th>階段</th>
+<th>時間</th>
+<th>工作內容</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td>Phase 0</td>
+<td>Month 1</td>
+<td>文獻精讀、語料盤點、環境建置</td>
+</tr>
+<tr class="even">
+<td>Phase 1</td>
+<td>Month 2-3</td>
+<td>基線系統建立（B1-B4）、Task vector 萃取</td>
+</tr>
+<tr class="odd">
+<td>Phase 2</td>
+<td>Month 3-4</td>
+<td>干涉度分析（CKA、task vector cosine sim）</td>
+</tr>
+<tr class="even">
+<td>Phase 3</td>
+<td>Month 4-6</td>
+<td>各 merging 方法實驗（P1-P4）</td>
+</tr>
+<tr class="odd">
+<td>Phase 4</td>
+<td>Month 6-8</td>
+<td>Hakka-Stitch 完整系統（P5-P6）</td>
+</tr>
+<tr class="even">
+<td>Phase 5</td>
+<td>Month 8-9</td>
+<td>方言適配實驗、ablation study</td>
+</tr>
+<tr class="odd">
+<td>Phase 6</td>
+<td>Month 9-10</td>
+<td>論文撰寫、投稿</td>
+</tr>
+</tbody>
+</table>
+<p><strong>目標投稿：</strong> Interspeech 2027 / ICASSP 2027 / ACL 2027</p>
+<hr />
+<h2 id="參考文獻">10. 參考文獻</h2>
+<h3 id="model-merging-核心理論">Model Merging 核心理論</h3>
+<ol type="1">
+<li>Ilharco, G., et al. “Editing Models with Task Arithmetic.” ICLR 2023. — Task Arithmetic 原論文</li>
+<li>Yadav, P., et al. “TIES-Merging: Resolving Interference When Merging Models.” NeurIPS 2024. — TIES-Merging</li>
+<li>Yu, L., et al. “Language Models are Super Mario: Absorbing Abilities from Homologous Models as a Free Lunch.” ICML 2024. — DARE</li>
+<li>Song, M. &amp; Zheng, M. “Model Merging in the Era of Large Language Models: Methods, Applications, and Future Directions.” arXiv:2603.xxxxx, Mar 2026. — 最新 survey</li>
+</ol>
+<h3 id="語音領域-model-merging">語音領域 Model Merging</h3>
+<ol start="5" type="1">
+<li><strong>Rafkin, E., DeGenaro, D., &amp; Yang, X.</strong> “Task Arithmetic with Support Languages for Low-Resource ASR.” arXiv:2601.07038, Jan 2026. ⭐ <strong>最直接相關</strong></li>
+<li><strong>Zhao, Q., Sun, G., &amp; Zhang, C.</strong> “Low-Rank and Sparse Model Merging for Multi-Lingual Speech Recognition and Translation.” arXiv:2502.17380, Feb 2025. ⭐ <strong>LoRS-Merging</strong></li>
+<li><strong>Rolland, T. &amp; Abad, A.</strong> “Group-Aware Partial Model Merging for Children’s ASR.” arXiv:2511.23098, Nov 2025.</li>
+<li><strong>Carvalho, C., et al.</strong> “Exploring the potential and limitations of Model Merging for Multi-Domain Adaptation in ASR.” Mar 2026.</li>
+<li><strong>Lin, T.-Q., Huang, W.-P., Tang, H., &amp; Lee, H.-Y.</strong> “Speech-FT: Merging Pre-trained And Fine-Tuned Speech Representation Models For Cross-Task Generalization.” IEEE TASLP, vol. 34, 2026. ⭐ <strong>台大 Hung-yi Lee 組</strong></li>
+<li><strong>Ducorroy, A. &amp; Riad, R.</strong> “Robust fine-tuning of speech recognition models via model merging: application to disordered speech.” May 2025.</li>
+<li><strong>Shankar, N. B., et al.</strong> “Selective Attention Merging for low resource tasks: A case study of Child ASR.” Jan 2025.</li>
+<li><strong>Ritter-Gutierrez, F., et al.</strong> “A correlation-permutation approach for speech-music encoders model merging.” Jun 2025.</li>
+</ol>
+<h3 id="客語相關">客語相關</h3>
+<ol start="13" type="1">
+<li><strong>Peng, A.-C., et al.</strong> “Efficient Dialect-Aware Modeling and Conditioning for Low-Resource Taiwanese Hakka Speech Processing.” Feb 2026. ⭐ <strong>直接客語研究</strong></li>
+<li>“VoxHakka: A Dialectally Diverse Multi-speaker Text-to-Speech System for Taiwanese Hakka.” Sep 2024.</li>
+</ol>
+<h3 id="其他">其他</h3>
+<ol start="15" type="1">
+<li><strong>Ramesh, P., et al.</strong> “Resolving Interference: Disentangling Models for Improved Model Merging.” Mar 2026. — 降低合併干涉的最新方法</li>
+<li>Kornblith, S., et al. “Similarity of Neural Network Representations Revisited.” ICML 2019. — CKA</li>
+</ol>
+<hr />
+<h2 id="附錄-a數學符號表">附錄 A：數學符號表</h2>
+<table>
+<thead>
+<tr class="header">
+<th>符號</th>
+<th>定義</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td><span class="math inline">\(\theta_{\text{pre}}\)</span></td>
+<td>預訓練模型權重</td>
+</tr>
+<tr class="even">
+<td><span class="math inline">\(\theta_t\)</span></td>
+<td>在任務 <span class="math inline">\(t\)</span> 上 fine-tune 後的權重</td>
+</tr>
+<tr class="odd">
+<td><span class="math inline">\(\tau_t\)</span></td>
+<td>任務向量 <span class="math inline">\(= \theta_t - \theta_{\text{pre}}\)</span></td>
+</tr>
+<tr class="even">
+<td><span class="math inline">\(\lambda, \alpha, \beta, \gamma\)</span></td>
+<td>合併係數</td>
+</tr>
+<tr class="odd">
+<td><span class="math inline">\(W_s, b_s\)</span></td>
+<td>Stitching layer 的權重與偏差</td>
+</tr>
+<tr class="even">
+<td>CER</td>
+<td>Character Error Rate</td>
+</tr>
+<tr class="odd">
+<td>WER</td>
+<td>Word Error Rate</td>
+</tr>
+<tr class="even">
+<td>CKA</td>
+<td>Centered Kernel Alignment</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="附錄-b提案總結一頁摘要">附錄 B：提案總結（一頁摘要）</h2>
+<p><strong>研究題目：</strong> Hakka-Stitch: Model Merging for Low-Resource Taiwanese Hakka Automatic Speech Recognition</p>
+<p><strong>核心問題：</strong> 能否透過合併已有的華語/粵語/少量客語 ASR 模型，在不需大量客語標註資料的前提下建構可用的客語 ASR 系統？</p>
+<p><strong>方法：</strong> 1. 從 Whisper 基座模型出發，fine-tune 多語言專家模型 2. 萃取 task vectors，用分層選擇性合併策略整合 3. 透過 stitching layer 做最終表示空間對齊</p>
+<p><strong>預期貢獻：</strong> - 首個將 model merging/stitching 應用於客語 ASR 的研究 - 提出分層合併策略（encoder 前段 vs 後段 vs decoder） - 方言感知的 partial merging 機制 - 為其他台灣本土語言（閩南語、原住民族語）提供可複製的方法論</p>
+<p><strong>關鍵假設待驗證：</strong> - 華語/粵語的 task vector 對客語 ASR 有正遷移效果 - 分層合併優於全模型統一合併 - Stitching layer 可用少量資料有效對齊表示空間</p>
+<hr />
+<p><em>報告結束。歡迎 Anna 提出修改建議，我們可以進一步深化任何章節。</em></p>
+</body>
+</html>
