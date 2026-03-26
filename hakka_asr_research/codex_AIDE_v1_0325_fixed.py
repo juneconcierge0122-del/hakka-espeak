@@ -69,10 +69,17 @@ def generate_response(_model: Llama, _messages: str, temperature) -> str:
     """
     _output = _model.create_chat_completion(
         messages=_messages,
-        stop=["<|endoftext|>", "<|user|>", "<|observation|>"],  # GLM-4 stop tokens
-        max_tokens=4096,    # This argument is how many tokens the model can generate.
-        temperature=temperature,  # Fix: actually use the passed-in temperature
+        stop=["<|endoftext|>", "<|user|>", "<|observation|>", "</think>"],  # GLM-4 stop tokens + stop thinking
+        max_tokens=4096,
+        temperature=temperature,
     )["choices"][0]["message"]["content"]
+
+    # GLM-4 thinking mode: strip <think>...</think> blocks
+    import re as _re
+    _output = _re.sub(r"<think>.*?</think>", "", _output, flags=_re.DOTALL).strip()
+    # If stopped mid-think, strip leftover <think>...
+    if "<think>" in _output:
+        _output = _output[:_output.index("<think>")].strip()
 
     return _output
 
@@ -88,11 +95,14 @@ if __name__ == "__main__":
         n_batch=256,
     )
     # Quick sanity check
+    import time as _time
+    _t0 = _time.time()
     _test_response = generate_response(myModel, [{"role": "user", "content": "Hi"}], temperature=0.0)
-    print(_test_response)
+    print(f"Sanity check response ({_time.time()-_t0:.1f}s): {_test_response[:200]}")
     print("=" * 60)
     print("Model loaded OK, starting AIDE agent...")
     print("=" * 60)
+    import sys; sys.stdout.flush()
 
 """## Functions
 
